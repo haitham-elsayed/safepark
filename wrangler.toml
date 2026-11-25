@@ -1,0 +1,16 @@
+name = "safepark"
+main = "src/index.js"
+compatibility_date = "2026-11-25"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "safepark"
+database_id = "YOUR_D1_DATABASE_ID" # from: npx wrangler d1 create safepark
+
+# Photos stored in D1 (photos table) - R2 requires billing on file
+
+[triggers]
+crons = ["7 * * * *"]
+
+[vars]
+APP_ORIGIN = "https://your-app.your-subdomain.workers.dev"

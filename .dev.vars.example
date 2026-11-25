@@ -1,0 +1,20 @@
+# Copy to .dev.vars for local development. Never commit .dev.vars.
+# In production set these with: npx wrangler secret put <NAME>
+
+# Secret that protects the one-time /setup page (choose a long random string)
+SETUP_SECRET=change-me-long-random
+
+# Telegram bot token from @BotFather (empty = Telegram notifications off)
+TELEGRAM_BOT_TOKEN=
+
+# Resend.com API key for email notifications (empty = email off, free tier: 100/day)
+RESEND_API_KEY=
+EMAIL_FROM=SafePark <alerts@your-domain.example>
+
+# Web push (PWA) VAPID keys. Generate: node scripts/gen-vapid.mjs
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:you@example.com
+
+# Public origin of the deployment (used in links, QR codes, stickers)
+APP_ORIGIN=http://localhost:8787
