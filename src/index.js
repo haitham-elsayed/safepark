@@ -389,7 +389,8 @@ app.get('/sticker/:code', async (c) => {
   if (!car) return c.notFound();
   const url = `${c.env.APP_ORIGIN}/c/${car.code}`;
   const qrSvg = await QRCode.toString(url, { type: 'svg', width: 220, margin: 1 });
-  return c.html(stickerPage({ car, origin: c.env.APP_ORIGIN, qrSvg }));
+  const minimal = c.req.query('minimal') === '1';
+  return c.html(stickerPage({ car, origin: c.env.APP_ORIGIN, qrSvg, minimal }));
 });
 
 

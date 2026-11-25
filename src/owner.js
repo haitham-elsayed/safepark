@@ -165,8 +165,20 @@ export function convPage({ conv, car, messages }) {
   return layout('ar', e(car.car_type), body);
 }
 
-export function stickerPage({ car, origin, qrSvg }) {
+export function stickerPage({ car, origin, qrSvg, minimal = false }) {
   const url = `${origin}/c/${car.code}`;
+  const printNote = `<p class="noprint muted">اطبع الصفحة دي (Ctrl+P). مقاس مناسب: نص A4 للعربية، ربع A4 للموتوسيكل. استخدم ورق مقاوم للشمس أو غلّفه بلاستيك.</p>`;
+  if (minimal) {
+    const body = `
+  <div class="card" style="border:2px dashed #999; text-align:center">
+    <div style="display:flex;justify-content:center">${qrSvg}</div>
+    <p><strong>محتاج صاحب العربية؟ امسح الكود وابعتله رسالة دلوقتي وهيرد عليك بسرعة</strong><br>
+    <span class="muted" dir="ltr" style="font-size:13px">Need the car owner? Scan the code and send a message now. They&#39;ll reply quickly.</span></p>
+  </div>
+  <p class="noprint muted"><a href="/sticker/${e(car.code)}">النسخة الكاملة</a></p>
+  ${printNote}`;
+    return layout('ar', 'ملصق مختصر', body);
+  }
   const body = `
   <div class="card" style="border:2px dashed #999; text-align:center">
     <h1>SafePark</h1>
@@ -179,6 +191,7 @@ export function stickerPage({ car, origin, qrSvg }) {
     <span dir="ltr">Never send money or banking details through this page.</span></p>
     <p class="muted" dir="ltr">${e(url)}</p>
   </div>
-  <p class="noprint muted">اطبع الصفحة دي (Ctrl+P). مقاس مناسب: نص A4 للعربية، ربع A4 للموتوسيكل. استخدم ورق مقاوم للشمس أو غلّفه بلاستيك.</p>`;
+  <p class="noprint muted"><a href="/sticker/${e(car.code)}?minimal=1">نسخة مختصرة للطباعة (كود وسطر واحد بس)</a></p>
+  ${printNote}`;
   return layout('ar', `SafePark — ${e(car.car_type)}`, body);
 }
