@@ -9,7 +9,7 @@ import { uid, carCode, hashPassword, escapeHtml as e, wantsArabic, inQuietHours 
 import { getOwner, rateCount, rateHit, senderMessageCount } from './db.js';
 import { notifyOwner, handleTelegramUpdate } from './notify.js';
 import { landing, loginPage, setupPage } from './html.js';
-import { senderPage, sentPage, threadPage, simplePage, tr } from './sender.js';
+import { senderPage, sentPage, threadPage, simplePage, tr, REASONS } from './sender.js';
 import { dashboardPage, convPage, stickerPage } from './owner.js';
 
 const app = new Hono();
@@ -184,7 +184,10 @@ app.post('/api/c/:code/send', async (c) => {
   const senderKey = uid(20);
   const email = String(body.sender_email || '').trim() || null;
   const photoKey = await storePhoto(c.env, body.photo instanceof File ? body.photo : null);
-  const urgent = String(body.urgent) === '1' ? 1 : 0;
+  // Urgency is derived here, never trusted from the client: a sender could
+  // otherwise set urgent=1 by hand and bypass quiet hours / unavailable mode.
+  const reasonText = String(body.reason || '');
+  const urgent = REASONS.some((r) => r.urgent && (reasonText === r.ar || reasonText === r.en || reasonText === r.key)) ? 1 : 0;
   const held = inQuietHours(owner) && !urgent ? 1 : 0;
 
   await c.env.DB.prepare('INSERT INTO conversations (id, car_id, sender_key, sender_email, sender_ip) VALUES (?, ?, ?, ?, ?)')
@@ -268,6 +271,11 @@ app.post('/api/thread/:convId/:key/send', async (c) => {
 app.get('/app', async (c) => {
   const owner = await requireOwner(c);
   if (!owner) return redirect('/login');
+  // Lazily create the one-time Telegram binding code the dashboard shows.
+  if (!owner.telegram_bind_token) {
+    owner.telegram_bind_token = uid(10);
+    await c.env.DB.prepare('UPDATE owners SET telegram_bind_token = ? WHERE id = ?').bind(owner.telegram_bind_token, owner.id).run();
+  }
   const { results: cars } = await c.env.DB.prepare('SELECT * FROM cars WHERE owner_id = ? ORDER BY created_at').bind(owner.id).all();
   const { results: convs } = await c.env.DB.prepare(
     `SELECT co.* FROM conversations co JOIN cars ca ON ca.id = co.car_id WHERE ca.owner_id = ? ORDER BY co.last_msg_at DESC LIMIT 100`,
@@ -427,6 +435,12 @@ app.post('/api/push/subscribe', async (c) => {
 // ---------- telegram webhook ----------
 
 app.post('/api/tg/webhook', async (c) => {
+  // When a webhook secret is configured, only Telegram (which sends it back
+  // as a header) may post updates. Unset = pilot behaviour, still protected
+  // by the binding-code and bound-chat checks in handleTelegramUpdate.
+  if (c.env.TELEGRAM_WEBHOOK_SECRET && c.req.header('x-telegram-bot-api-secret-token') !== c.env.TELEGRAM_WEBHOOK_SECRET) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
   const update = await c.req.json().catch(() => null);
   if (update) c.executionCtx.waitUntil(handleTelegramUpdate(c.env, update));
   return c.json({ ok: true });
@@ -470,16 +484,21 @@ app.get('/health', (c) => c.json({ ok: true, service: 'safepark', time: new Date
 
 async function runScheduled(env) {
   // Retention: conversations older than 30 days, reports kept 90 days.
-  await env.DB.prepare(
-    `DELETE FROM messages WHERE conversation_id IN (
-       SELECT id FROM conversations WHERE reported = 0 AND last_msg_at < datetime('now', '-30 days'))`,
-  ).run();
-  await env.DB.prepare(`DELETE FROM conversations WHERE reported = 0 AND last_msg_at < datetime('now', '-30 days')`).run();
-  await env.DB.prepare(
-    `DELETE FROM messages WHERE conversation_id IN (
-       SELECT id FROM conversations WHERE reported = 1 AND last_msg_at < datetime('now', '-90 days'))`,
-  ).run();
-  await env.DB.prepare(`DELETE FROM conversations WHERE reported = 1 AND last_msg_at < datetime('now', '-90 days')`).run();
+  // Photos go first: they live in their own table, and deleting only the
+  // messages would leave the image data in D1 forever, breaking the
+  // retention promise (and leaking storage).
+  for (const [reported, days] of [[0, 30], [1, 90]]) {
+    await env.DB.prepare(
+      `DELETE FROM photos WHERE key IN (
+         SELECT m.photo_key FROM messages m JOIN conversations co ON co.id = m.conversation_id
+         WHERE m.photo_key IS NOT NULL AND co.reported = ? AND co.last_msg_at < datetime('now', ?))`,
+    ).bind(reported, `-${days} days`).run();
+    await env.DB.prepare(
+      `DELETE FROM messages WHERE conversation_id IN (
+         SELECT id FROM conversations WHERE reported = ? AND last_msg_at < datetime('now', ?))`,
+    ).bind(reported, `-${days} days`).run();
+    await env.DB.prepare(`DELETE FROM conversations WHERE reported = ? AND last_msg_at < datetime('now', ?)`).bind(reported, `-${days} days`).run();
+  }
   await env.DB.prepare(`DELETE FROM rate_events WHERE created_at < datetime('now', '-2 days')`).run();
   await env.DB.prepare(`DELETE FROM captchas WHERE expires_at < datetime('now')`).run();
 

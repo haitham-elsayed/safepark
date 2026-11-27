@@ -159,10 +159,14 @@ r = await req(`/api/c/${CODE}/send`, { method: 'POST', headers: ip(20), body: fo
 check('message during quiet hours still delivered', r.status === 200, `status=${r.status} snippet=${r.text.slice(0, 200)}`);
 const heldRow = sql(`SELECT held FROM messages WHERE body = 'رسالة أثناء الهدوء'`)[0];
 check('notification held during quiet hours', heldRow && heldRow.held === 1);
-// urgent bypass
-r = await req(`/api/c/${CODE}/send`, { method: 'POST', headers: ip(21), body: form({ body: 'النور مولع', reason: 'النور مولع', urgent: '1' }) });
+// urgent bypass: urgency comes from the (urgent) reason alone
+r = await req(`/api/c/${CODE}/send`, { method: 'POST', headers: ip(21), body: form({ body: 'النور مولع', reason: 'النور مولع' }) });
 const urgRow = sql(`SELECT held, urgent FROM messages WHERE body = 'النور مولع'`)[0];
-check('urgent message bypasses quiet hours', urgRow && urgRow.held === 0 && urgRow.urgent === 1);
+check('urgent reason bypasses quiet hours', urgRow && urgRow.held === 0 && urgRow.urgent === 1);
+// a forged urgent=1 on a non-urgent reason must be ignored
+r = await req(`/api/c/${CODE}/send`, { method: 'POST', headers: ip(22), body: form({ body: 'رسالة عادية بعلم عاجل مزور', reason: 'سبب آخر', urgent: '1' }) });
+const forgedRow = sql(`SELECT held, urgent FROM messages WHERE body = 'رسالة عادية بعلم عاجل مزور'`)[0];
+check('forged urgent flag ignored for non-urgent reason', forgedRow && forgedRow.held === 1 && forgedRow.urgent === 0);
 // reset quiet hours
 await req('/api/settings', { method: 'POST', headers: { ...ip(1), cookie }, body: form({ quiet_start: '', quiet_end: '' }) });
 
@@ -214,32 +218,62 @@ if (photoConv) {
   }
 }
 
-// telegram webhook: /start binds chat id
+// telegram webhook: a bare /start must NOT bind (anyone can find the bot)
 r = await req('/api/tg/webhook', {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ message: { text: '/start', chat: { id: 777 } } }),
 });
 check('telegram webhook accepted', r.status === 200);
 await new Promise((s) => setTimeout(s, 800));
-check('chat id bound to owner', sql('SELECT telegram_chat_id FROM owners LIMIT 1')[0].telegram_chat_id === '777');
-
-// telegram quick-reply callback inserts an owner reply
+check('bare /start does not bind chat id', !sql('SELECT telegram_chat_id FROM owners LIMIT 1')[0].telegram_chat_id);
+// binding works only with the one-time code from the dashboard
+await req('/app', { headers: { cookie } }); // dashboard visit generates the code
+const bindToken = sql('SELECT telegram_bind_token FROM owners LIMIT 1')[0].telegram_bind_token;
+check('dashboard generated a bind code', !!bindToken);
 r = await req('/api/tg/webhook', {
   method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ callback_query: { id: 'cb1', data: `qr:${convId}:1` } }),
+  body: JSON.stringify({ message: { text: `/start ${bindToken}`, chat: { id: 777 } } }),
+});
+await new Promise((s) => setTimeout(s, 800));
+check('chat id bound with the dashboard code', sql('SELECT telegram_chat_id FROM owners LIMIT 1')[0].telegram_chat_id === '777');
+check('bind code is single-use (cleared after binding)', !sql('SELECT telegram_bind_token FROM owners LIMIT 1')[0].telegram_bind_token);
+// and a later bare /start from a stranger cannot steal the binding
+r = await req('/api/tg/webhook', {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ message: { text: '/start', chat: { id: 888 } } }),
+});
+await new Promise((s) => setTimeout(s, 800));
+check('stranger /start cannot rebind', sql('SELECT telegram_chat_id FROM owners LIMIT 1')[0].telegram_chat_id === '777');
+
+// telegram quick-reply callback from a foreign chat must be ignored
+const qrBefore = sql(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = '${convId}' AND direction = 'out' AND body = 'جاي في دقيقتين'`)[0].n;
+r = await req('/api/tg/webhook', {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ callback_query: { id: 'cb0', data: `qr:${convId}:1`, message: { chat: { id: 999 } } } }),
+});
+await new Promise((s) => setTimeout(s, 800));
+check('quick reply from foreign chat ignored',
+  sql(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = '${convId}' AND direction = 'out' AND body = 'جاي في دقيقتين'`)[0].n === qrBefore);
+
+// telegram quick-reply callback from the bound chat inserts an owner reply
+r = await req('/api/tg/webhook', {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ callback_query: { id: 'cb1', data: `qr:${convId}:1`, message: { chat: { id: 777 } } } }),
 });
 check('quick-reply callback accepted', r.status === 200);
 await new Promise((s) => setTimeout(s, 800));
 check('quick reply stored as owner message',
-  sql(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = '${convId}' AND direction = 'out' AND body = 'جاي في دقيقتين'`)[0].n >= 1);
+  sql(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = '${convId}' AND direction = 'out' AND body = 'جاي في دقيقتين'`)[0].n > qrBefore);
 
 // retention: fake an old conversation, run the scheduled handler
 sql(`INSERT INTO conversations (id, car_id, sender_key, last_msg_at) VALUES ('oldconv', '${car.id}', 'oldkey', datetime('now', '-40 days'))`);
-sql(`INSERT INTO messages (id, conversation_id, direction, body, created_at) VALUES ('oldmsg', 'oldconv', 'in', 'old', datetime('now', '-40 days'))`);
+sql(`INSERT INTO messages (id, conversation_id, direction, body, photo_key, created_at) VALUES ('oldmsg', 'oldconv', 'in', 'old', 'oldphoto', datetime('now', '-40 days'))`);
+sql(`INSERT INTO photos (key, content_type, data) VALUES ('oldphoto', 'image/jpeg', X'FFD8FFE0')`);
 r = await req('/__scheduled?cron=*+*+*+*');
 check('scheduled endpoint runs', r.status === 200);
 await new Promise((s) => setTimeout(s, 800));
 check('old conversations purged (30d rule)', sql(`SELECT COUNT(*) AS n FROM conversations WHERE id = 'oldconv'`)[0].n === 0);
+check('photos of purged conversations are deleted too', sql(`SELECT COUNT(*) AS n FROM photos WHERE key = 'oldphoto'`)[0].n === 0);
 check('reported conversation kept (90d rule)', sql(`SELECT COUNT(*) AS n FROM conversations WHERE id = '${convId}'`)[0].n === 1);
 
 // pwa bits

@@ -109,7 +109,6 @@ export function senderPage({ lang, car, captcha, plateCheck, error, origin }) {
       <label>${t.why}</label>
       <div class="chips">${reasonChips}</div>
       <input type="hidden" name="reason" id="reason">
-      <input type="hidden" name="urgent" id="urgent" value="0">
       <label>${t.msg}</label>
       <textarea name="body" placeholder="${t.msgPh}" maxlength="1000" required></textarea>
       ${plateBlock}
@@ -134,7 +133,6 @@ export function senderPage({ lang, car, captcha, plateCheck, error, origin }) {
         document.querySelectorAll('.chip').forEach(function(x){x.classList.remove('on')});
         c.classList.add('on');
         document.getElementById('reason').value = c.dataset.label;
-        document.getElementById('urgent').value = c.dataset.urgent;
       });
     });
   </script>`;

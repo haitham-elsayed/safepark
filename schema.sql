@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS owners (
   password_salt TEXT NOT NULL,
   phone TEXT,
   telegram_chat_id TEXT,
+  telegram_bind_token TEXT,       -- one-time code for binding Telegram, shown only in the dashboard
   notify_email INTEGER DEFAULT 1,
   notify_push INTEGER DEFAULT 1,
   quiet_start INTEGER,            -- minutes from midnight local, NULL = off

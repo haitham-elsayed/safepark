@@ -55,7 +55,9 @@ npx wrangler d1 execute safepark --remote --file ./schema.sql
 npx wrangler deploy
 ```
 
-بعد النشر: افتح `/setup?key=<SETUP_SECRET>` مرة واحدة لإنشاء حسابك، ثم اربط تيليجرام بفتح البوت وإرسال `/start`، واضبط ويبهوك البوت على `https://<الرابط>/api/tg/webhook`.
+بعد النشر: افتح `/setup?key=<SETUP_SECRET>` مرة واحدة لإنشاء حسابك، واضبط ويبهوك البوت على `https://<الرابط>/api/tg/webhook` (ويستحسن مع `secret_token` مطابق لقيمة `TELEGRAM_WEBHOOK_SECRET`)، ثم اربط تيليجرام بإرسال أمر الربط الظاهر في لوحة التحكم (`/start <الكود>`) — الـ `/start` العادي لا يربط أي حساب.
+
+ترقية قاعدة بيانات موجودة: نفّذ مرة واحدة `npx wrangler d1 execute safepark --remote --command "ALTER TABLE owners ADD COLUMN telegram_bind_token TEXT"`.
 
 ## بنية المشروع
 

@@ -110,15 +110,35 @@ export async function handleTelegramUpdate(env, update) {
 
   const msg = update.message;
   if (msg?.text?.startsWith('/start')) {
-    const owner = await env.DB.prepare('SELECT id FROM owners ORDER BY created_at LIMIT 1').first();
-    if (owner) {
-      await env.DB.prepare('UPDATE owners SET telegram_chat_id = ? WHERE id = ?').bind(String(msg.chat.id), owner.id).run();
-      await post('sendMessage', { chat_id: msg.chat.id, text: 'تم ربط إشعارات SafePark بهذا الحساب.' });
+    const owner = await env.DB.prepare('SELECT id, telegram_chat_id, telegram_bind_token FROM owners ORDER BY created_at LIMIT 1').first();
+    if (!owner) return;
+    const chatId = String(msg.chat.id);
+    // Already bound to this chat: nothing to do, no token needed.
+    if (owner.telegram_chat_id === chatId) {
+      await post('sendMessage', { chat_id: msg.chat.id, text: 'إشعارات SafePark مربوطة بالحساب ده بالفعل.' });
+      return;
     }
+    // Binding (or rebinding to a different chat) requires the one-time code
+    // shown only in the owner's dashboard. A bare /start must never bind:
+    // anyone who finds the bot could otherwise hijack the owner's alerts.
+    const token = msg.text.trim().split(/\s+/)[1] || '';
+    if (!token || !owner.telegram_bind_token || token !== owner.telegram_bind_token) {
+      await post('sendMessage', { chat_id: msg.chat.id, text: 'للربط، ابعت الكود اللي ظاهر في لوحة تحكم SafePark بالشكل ده: /start <الكود>' });
+      return;
+    }
+    await env.DB.prepare('UPDATE owners SET telegram_chat_id = ?, telegram_bind_token = NULL WHERE id = ?').bind(chatId, owner.id).run();
+    await post('sendMessage', { chat_id: msg.chat.id, text: 'تم ربط إشعارات SafePark بهذا الحساب.' });
     return;
   }
   const cq = update.callback_query;
   if (cq?.data?.startsWith('qr:')) {
+    // Quick replies act as the owner: only accept them from the bound chat.
+    const owner = await env.DB.prepare('SELECT telegram_chat_id FROM owners ORDER BY created_at LIMIT 1').first();
+    const fromChat = cq.message?.chat?.id;
+    if (!owner?.telegram_chat_id || fromChat == null || String(fromChat) !== String(owner.telegram_chat_id)) {
+      await post('answerCallbackQuery', { callback_query_id: cq.id, text: 'الحساب ده مش مربوط بـ SafePark' });
+      return;
+    }
     const [, convId, choice] = cq.data.split(':');
     const replies = { 1: 'جاي في دقيقتين', 2: `جاي خلال ٥ دقايق (${arrivalTime(5)})`, 3: 'مش قادر دلوقتي' };
     const body = replies[choice];

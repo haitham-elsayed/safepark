@@ -6,6 +6,9 @@ SETUP_SECRET=change-me-long-random
 
 # Telegram bot token from @BotFather (empty = Telegram notifications off)
 TELEGRAM_BOT_TOKEN=
+# Optional but recommended: secret you set when registering the webhook
+# (setWebhook secret_token). Webhook calls without it are rejected.
+TELEGRAM_WEBHOOK_SECRET=
 
 # Resend.com API key for email notifications (empty = email off, free tier: 100/day)
 RESEND_API_KEY=

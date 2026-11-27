@@ -23,7 +23,7 @@ const T = {
   unavailable: 'مش متاح دلوقتي (كل الإشعارات غير العاجلة تتأجل)',
   save: 'حفظ',
   telegram: 'إشعارات تيليجرام',
-  telegramHow: 'افتح بوت SafePark في تيليجرام وابعت /start وهيتربط تلقائياً.',
+  telegramHow: 'افتح بوت SafePark في تيليجرام وابعت أمر الربط اللي فيه الكود ده (الكود بيظهر هنا بس وبيتلغي بعد أول ربط ناجح):',
   blockedTag: 'مقيّد',
   reportedTag: 'مُبلغ عنه',
   block: 'حظر المرسل',
@@ -84,6 +84,7 @@ export function dashboardPage({ owner, cars, convsByCar, origin }) {
     <hr>
     <h2>${T.telegram}</h2>
     <p class="muted">${T.telegramHow}</p>
+    ${owner.telegram_bind_token ? `<p dir="ltr" style="font-family:monospace">/start ${e(owner.telegram_bind_token)}</p>` : ''}
     <p class="muted" dir="ltr">${owner.telegram_chat_id ? '✅ linked' : 'not linked'}</p>
   </div>
   <script>
