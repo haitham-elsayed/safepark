@@ -108,6 +108,9 @@ check('second message without captcha ok', r.status === 302);
 // message 3: captcha now required
 r = await req(`/api/thread/${convId}/${senderKey}/send`, { method: 'POST', headers: ip(2), body: form({ body: 'ثالث رسالة' }) });
 check('third message requires captcha', r.status === 400);
+check('failed captcha re-renders thread with a fresh captcha (no dead end)', r.text.includes('name="captcha_answer"'));
+r = await req(`/s/${convId}/${senderKey}`, { headers: { 'x-forwarded-for': '10.0.0.2' } });
+check('thread page itself shows a captcha after 2 messages', r.text.includes('name="captcha_answer"'));
 
 // get a captcha from the sender page, solve it from DB
 r = await req(`/c/${CODE}`, { headers: { 'x-forwarded-for': '10.0.0.2' } });
@@ -287,6 +290,34 @@ check('push subscription stored', r.status === 200 && sql('SELECT COUNT(*) AS n 
 // english sender page
 r = await req(`/c/${CODE}`, { headers: { 'accept-language': 'en-US,en;q=0.9' } });
 check('english auto-detected for sender', r.text.includes('Message the car owner'));
+
+// --- phase 1: setup validation, login brake, logout, manifest ---
+r = await req('/api/setup', { method: 'POST', headers: ip(1), body: form({ key: 'dev-setup-secret', email: 'new@test.com', password: 'short', car_type: 'x', plate: 'y' }) });
+check('setup rejects a short password server-side', r.status === 400);
+
+for (let i = 0; i < 10; i++) {
+  await req('/api/login', { method: 'POST', headers: ip(99), body: form({ email: 'owner@test.com', password: 'wrongpass1' }) });
+}
+r = await req('/api/login', { method: 'POST', headers: ip(99), body: form({ email: 'owner@test.com', password: 'supersecret1' }) });
+check('login locked after 10 failed attempts (even with right password)', r.status === 429);
+
+r = await req('/api/login', { method: 'POST', headers: ip(1), body: form({ email: 'owner@test.com', password: 'supersecret1' }) });
+const cookie2 = (r.headers.get('set-cookie') || '').split(';')[0];
+r = await req('/app', { headers: { cookie: cookie2 } });
+check('second session works before logout', r.status === 200);
+await req('/logout', { headers: { cookie: cookie2 } });
+r = await req('/app', { headers: { cookie: cookie2 } });
+check('logout invalidates the session server-side', r.status === 302);
+
+sql(`INSERT INTO sessions (token, owner_id, expires_at) VALUES ('deadbeefdeadbeef', (SELECT id FROM owners LIMIT 1), datetime('now', '-1 day'))`);
+await req('/__scheduled?cron=*+*+*+*');
+await new Promise((s) => setTimeout(s, 800));
+check('expired sessions purged by scheduled job', sql(`SELECT COUNT(*) AS n FROM sessions WHERE token = 'deadbeefdeadbeef'`)[0].n === 0);
+
+r = await req('/manifest.webmanifest');
+check('manifest declares an icon', (JSON.parse(r.text).icons || []).length >= 1);
+r = await req('/icon.svg');
+check('icon is served as svg', r.status === 200 && r.text.includes('<svg'));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

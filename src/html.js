@@ -50,6 +50,7 @@ export function layout(lang, title, body, extraHead = '') {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#123c2b">
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>${e(title)}</title>
 <style>
 :root{--g:#123c2b;--a:#1f7a4d;--bg:#f6f7f6;--warn:#fff7e6;--danger:#b3261e}

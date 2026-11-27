@@ -152,7 +152,7 @@ export function sentPage({ lang, conv, followUrl }) {
   return layout(lang, t.sent, body);
 }
 
-export function threadPage({ lang, conv, car, messages, canSend, notice }) {
+export function threadPage({ lang, conv, car, messages, canSend, notice, captcha }) {
   const t = tr(lang);
   const msgs = messages
     .map((m) => {
@@ -164,9 +164,15 @@ export function threadPage({ lang, conv, car, messages, canSend, notice }) {
       return `<div class="msg ${cls}"><div class="muted">${e(who)}</div>${m.reason ? `<strong>${e(m.reason)}</strong><br>` : ''}${e(m.body)}${photo}</div>`;
     })
     .join('');
+  const captchaBlock = captcha
+    ? `<label>${t.captchaQ} ${e(captcha.question)}؟</label>
+       <input name="captcha_answer" inputmode="numeric" required>
+       <input type="hidden" name="captcha_id" value="${e(captcha.id)}">`
+    : '';
   const sendBox = canSend
     ? `<form method="post" action="/api/thread/${e(conv.id)}/${e(conv.sender_key)}/send">
         <textarea name="body" maxlength="1000" required placeholder="${t.msgPh}"></textarea>
+        ${captchaBlock}
         <button class="full" type="submit">${t.sendMore}</button>
       </form>`
     : `<div class="warn">${t.blocked}</div>`;

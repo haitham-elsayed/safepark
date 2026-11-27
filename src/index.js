@@ -5,7 +5,7 @@ import { Hono } from 'hono';
 import QRCode from 'qrcode';
 import piexif from 'piexifjs';
 
-import { uid, carCode, hashPassword, escapeHtml as e, wantsArabic, inQuietHours } from './util.js';
+import { uid, carCode, hashPassword, escapeHtml as e, wantsArabic, inQuietHours, timingSafeEqual } from './util.js';
 import { getOwner, rateCount, rateHit, senderMessageCount } from './db.js';
 import { notifyOwner, handleTelegramUpdate } from './notify.js';
 import { landing, loginPage, setupPage } from './html.js';
@@ -102,6 +102,13 @@ app.get('/setup', async (c) => {
 app.post('/api/setup', async (c) => {
   const body = await c.req.parseBody();
   if (body.key !== c.env.SETUP_SECRET) return c.notFound();
+  // Server-side validation: the HTML form's constraints are not a boundary,
+  // a direct API call must not be able to create a weak account.
+  const email = String(body.email || '').trim().toLowerCase();
+  const password = String(body.password || '');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 8 || !String(body.car_type || '').trim() || !String(body.plate || '').trim()) {
+    return c.html(simplePage('ar', 'بيانات ناقصة', 'اتأكد من الإيميل، وكلمة سر من ٨ حروف على الأقل، ونوع العربية واللوحة.'), 400);
+  }
   const existing = await getOwner(c.env.DB);
   if (existing) return c.html(simplePage('ar', 'تم', 'الإعداد اتعمل قبل كده.'));
   const { hash, salt } = await hashPassword(String(body.password));
@@ -115,28 +122,52 @@ app.post('/api/setup', async (c) => {
 
 app.get('/login', (c) => c.html(loginPage(lang(c))));
 
+function sessionCookie(c, token, maxAge) {
+  // Secure on real (https) deployments; left off for plain-http local dev.
+  const secure = c.req.url.startsWith('https://') ? '; Secure' : '';
+  return `sp_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
 app.post('/api/login', async (c) => {
   const body = await c.req.parseBody();
+  const ip = senderIp(c);
+  // Brute-force brake: 10 failed attempts per IP per hour lock further tries.
+  if (await rateCount(c.env.DB, 'login_fail', ip, 3600) >= 10) {
+    const msg = lang(c) === 'ar' ? 'محاولات دخول كتير غلط. استنى شوية وحاول تاني.' : 'Too many failed sign-in attempts. Wait a while and try again.';
+    return c.html(loginPage(lang(c), msg), 429);
+  }
   const owner = await c.env.DB.prepare('SELECT * FROM owners WHERE email = ?').bind(String(body.email || '').toLowerCase()).first();
   let ok = false;
   if (owner) {
     const { hash } = await hashPassword(String(body.password), owner.password_salt);
-    ok = hash === owner.password_hash;
+    ok = timingSafeEqual(hash, owner.password_hash);
+  } else {
+    // Run the same PBKDF2 work for unknown emails so response timing does
+    // not reveal whether the account exists.
+    await hashPassword(String(body.password || ''), '00'.repeat(16));
   }
-  if (!ok) return c.html(loginPage(lang(c), tr(lang(c)).wrongLogin), 401);
+  if (!ok) {
+    await rateHit(c.env.DB, 'login_fail', ip);
+    return c.html(loginPage(lang(c), tr(lang(c)).wrongLogin), 401);
+  }
   const token = uid(24);
   await c.env.DB.prepare(`INSERT INTO sessions (token, owner_id, expires_at) VALUES (?, ?, datetime('now', '+7 days'))`)
     .bind(token, owner.id).run();
   return new Response(null, {
     status: 302,
-    headers: { location: '/app', 'set-cookie': `sp_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800` },
+    headers: { location: '/app', 'set-cookie': sessionCookie(c, token, 604800) },
   });
 });
 
 app.get('/logout', async (c) => {
+  // Invalidate the session server-side too: clearing the cookie alone would
+  // leave a stolen token valid until it expires (7 days).
+  const cookie = c.req.header('cookie') || '';
+  const token = cookie.match(/(?:^|;\s*)sp_session=([a-f0-9]+)/)?.[1];
+  if (token) await c.env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run();
   return new Response(null, {
     status: 302,
-    headers: { location: '/', 'set-cookie': 'sp_session=; Path=/; HttpOnly; Max-Age=0' },
+    headers: { location: '/', 'set-cookie': sessionCookie(c, '', 0) },
   });
 });
 
@@ -162,7 +193,13 @@ app.post('/api/c/:code/send', async (c) => {
   const owner = await c.env.DB.prepare('SELECT * FROM owners WHERE id = ?').bind(car.owner_id).first();
   const body = await c.req.parseBody();
   const ip = senderIp(c);
-  const err = (m) => c.html(senderPage({ lang: l, car, captcha: null, plateCheck: !!car.plate_check, error: m, origin: c.env.APP_ORIGIN }), 400);
+  // Error re-renders must carry a fresh captcha when one is required, or the
+  // sender is stuck: the form asks for an answer it never shows.
+  const err = async (m) => {
+    const needsCaptcha = (await senderMessageCount(c.env.DB, ip, '')) >= 2;
+    const captcha = needsCaptcha ? await makeCaptcha(c.env.DB) : null;
+    return c.html(senderPage({ lang: l, car, captcha, plateCheck: !!car.plate_check, error: m, origin: c.env.APP_ORIGIN }), 400);
+  };
 
   const msgText = String(body.body || '').trim();
   if (!msgText) return err(t.msgPh);
@@ -225,7 +262,11 @@ app.get('/s/:convId/:key', async (c) => {
   const { results: messages } = await c.env.DB.prepare(
     'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid',
   ).bind(conv.id).all();
-  return c.html(threadPage({ lang: l, conv, car, messages, canSend: !conv.blocked }));
+  // The send handler demands a captcha after 2 messages, so the form must
+  // actually show one here — without it follow-up messages dead-end.
+  const prior = await senderMessageCount(c.env.DB, senderIp(c), conv.sender_key);
+  const captcha = prior >= 2 && !conv.blocked ? await makeCaptcha(c.env.DB) : null;
+  return c.html(threadPage({ lang: l, conv, car, messages, canSend: !conv.blocked, captcha }));
 });
 
 app.get('/api/thread/:convId/:key', async (c) => {
@@ -250,7 +291,15 @@ app.post('/api/thread/:convId/:key/send', async (c) => {
   const priorCount = await senderMessageCount(c.env.DB, ip, conv.sender_key);
   if (priorCount >= 2) {
     const ok = await checkCaptcha(c.env.DB, String(body.captcha_id || ''), String(body.captcha_answer || ''));
-    if (!ok) return c.html(simplePage(l, 'SafePark', t.wrongCaptcha), 400);
+    if (!ok) {
+      // Back to the thread with a fresh captcha and the reason, not a dead end.
+      const car2 = await c.env.DB.prepare('SELECT * FROM cars WHERE id = ?').bind(conv.car_id).first();
+      const { results: messages } = await c.env.DB.prepare(
+        'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid',
+      ).bind(conv.id).all();
+      const captcha = await makeCaptcha(c.env.DB);
+      return c.html(threadPage({ lang: l, conv, car: car2, messages, canSend: true, captcha, notice: t.wrongCaptcha }), 400);
+    }
   }
   const msgText = String(body.body || '').trim().slice(0, 1000);
   if (!msgText) return redirect(`/s/${conv.id}/${conv.sender_key}`);
@@ -448,6 +497,10 @@ app.post('/api/tg/webhook', async (c) => {
 
 // ---------- pwa ----------
 
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="96" fill="#123c2b"/><text x="256" y="330" font-family="Arial, sans-serif" font-size="220" font-weight="700" fill="#ffffff" text-anchor="middle">SP</text></svg>`;
+
+app.get('/icon.svg', (c) => new Response(ICON_SVG, { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' } }));
+
 app.get('/manifest.webmanifest', (c) =>
   c.json({
     name: 'SafePark',
@@ -456,7 +509,7 @@ app.get('/manifest.webmanifest', (c) =>
     display: 'standalone',
     background_color: '#f6f7f6',
     theme_color: '#123c2b',
-    icons: [],
+    icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }],
   }),
 );
 
@@ -501,6 +554,7 @@ async function runScheduled(env) {
   }
   await env.DB.prepare(`DELETE FROM rate_events WHERE created_at < datetime('now', '-2 days')`).run();
   await env.DB.prepare(`DELETE FROM captchas WHERE expires_at < datetime('now')`).run();
+  await env.DB.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
 
   // Flush notifications held by quiet hours once the window has passed.
   const owner = await getOwner(env.DB);
