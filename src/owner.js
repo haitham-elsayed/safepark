@@ -24,6 +24,12 @@ const T = {
   save: 'حفظ',
   telegram: 'إشعارات تيليجرام',
   telegramHow: 'افتح بوت SafePark في تيليجرام وابعت أمر الربط اللي فيه الكود ده (الكود بيظهر هنا بس وبيتلغي بعد أول ربط ناجح):',
+  editCar: 'تعديل بيانات العربية',
+  deleteCar: 'حذف العربية',
+  deleteConfirm: 'متأكد؟ هتتمسح العربية وكل محادثاتها وصورها نهائيًا.',
+  changePw: 'تغيير كلمة السر',
+  currentPw: 'كلمة السر الحالية',
+  newPw: 'الجديدة (٨ حروف على الأقل)',
   blockedTag: 'مقيّد',
   reportedTag: 'مُبلغ عنه',
   block: 'حظر المرسل',
@@ -53,6 +59,16 @@ export function dashboardPage({ owner, cars, convsByCar, origin }) {
           </form>
         </div>
         <p class="muted" dir="ltr">${T.senderLink}: ${e(origin)}/c/${e(car.code)}</p>
+        <details><summary class="muted">${T.editCar}</summary>
+          <form method="post" action="/api/cars/${e(car.id)}/edit">
+            <label>${T.carType}</label><input name="car_type" value="${e(car.car_type)}" required>
+            <label>${T.plate}</label><input name="plate" value="${e(car.plate || '')}" required>
+            <button class="full" type="submit">${T.save}</button>
+          </form>
+          <form method="post" action="/api/cars/${e(car.id)}/delete" onsubmit="return confirm('${T.deleteConfirm}')">
+            <button class="full danger" type="submit">${T.deleteCar}</button>
+          </form>
+        </details>
         ${convs || `<p class="muted">${T.noConvs}</p>`}
       </div>`;
     })
@@ -80,6 +96,13 @@ export function dashboardPage({ owner, cars, convsByCar, origin }) {
       <label class="row"><span>${T.unavailable}</span>
       <input style="width:auto" type="checkbox" name="unavailable" ${owner.unavailable ? 'checked' : ''}></label>
       <button class="full" type="submit">${T.save}</button>
+    </form>
+    <hr>
+    <h2>${T.changePw}</h2>
+    <form method="post" action="/api/settings/password">
+      <label>${T.currentPw}</label><input type="password" name="current_password" required>
+      <label>${T.newPw}</label><input type="password" name="new_password" minlength="8" required>
+      <button class="full" type="submit">${T.changePw}</button>
     </form>
     <hr>
     <h2>${T.telegram}</h2>

@@ -151,9 +151,11 @@ r = await req(`/api/thread/${convId}/${senderKey}/send`, { method: 'POST', heade
 check('blocked sender cannot send', r.status === 403);
 await req(`/api/conv/${convId}/unblock`, { method: 'POST', headers: { cookie } });
 
-// report
+// report: only the sender's own conversations get flagged
 r = await req(`/api/c/${CODE}/report`, { method: 'POST', headers: ip(9) });
 check('report button works', r.status === 200 && (r.text.includes('بلاغك') || r.text.includes('report')));
+check('a stranger cannot flag someone else\'s conversation', sql(`SELECT reported FROM conversations WHERE id = '${convId}'`)[0].reported === 0);
+r = await req(`/api/c/${CODE}/report`, { method: 'POST', headers: ip(2) });
 check('report flagged in DB', sql(`SELECT reported FROM conversations WHERE id = '${convId}'`)[0].reported === 1);
 
 // quiet hours: cover current Cairo time, then send from fresh IP
@@ -318,6 +320,80 @@ r = await req('/manifest.webmanifest');
 check('manifest declares an icon', (JSON.parse(r.text).icons || []).length >= 1);
 r = await req('/icon.svg');
 check('icon is served as svg', r.status === 200 && r.text.includes('<svg'));
+
+// --- phase 2: PNG metadata, photo rejection, car ops, edit/delete, password ---
+function crc32(buf) {
+  let table = crc32.t;
+  if (!table) {
+    table = crc32.t = [];
+    for (let n = 0; n < 256; n++) { let x = n; for (let k = 0; k < 8; k++) x = x & 1 ? 0xedb88320 ^ (x >>> 1) : x >>> 1; table[n] = x >>> 0; }
+  }
+  let crc = 0xffffffff;
+  for (const b of buf) crc = table[(crc ^ b) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
+  return Buffer.concat([len, body, crc]);
+}
+const png1px = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
+const pngWithText = Buffer.concat([
+  png1px.subarray(0, png1px.length - 12),
+  pngChunk('tEXt', Buffer.from('Comment\x00secret-location-123', 'latin1')),
+  png1px.subarray(png1px.length - 12),
+]);
+const fdPng = new FormData();
+fdPng.append('body', 'صورة png');
+fdPng.append('photo', new Blob([pngWithText], { type: 'image/png' }), 'p.png');
+r = await fetch(BASE + `/api/c/${CODE}/send`, { method: 'POST', headers: { 'x-forwarded-for': '10.0.0.60', 'accept-language': 'ar-EG,ar;q=0.9' }, body: fdPng });
+const pngText = await r.text();
+const pngConv = pngText.match(/\/s\/([a-f0-9]+)\/([a-f0-9]+)/);
+check('png photo message accepted', !!pngConv, `status=${r.status}`);
+if (pngConv) {
+  const pk = sql(`SELECT photo_key FROM messages WHERE conversation_id = '${pngConv[1]}'`)[0]?.photo_key;
+  const pres = await fetch(BASE + `/photo/${pk}?k=${pngConv[2]}`);
+  const pbuf = Buffer.from(await pres.arrayBuffer());
+  check('png text metadata stripped from stored photo', !pbuf.toString('latin1').includes('secret-location-123'));
+  check('stripped png is still a valid png', pbuf.subarray(1, 4).toString('latin1') === 'PNG' && pbuf.toString('latin1').includes('IEND'));
+}
+
+const fdBig = new FormData();
+fdBig.append('body', 'صورة كبيرة');
+fdBig.append('photo', new Blob([new Uint8Array(1600 * 1024)], { type: 'image/png' }), 'big.png');
+r = await fetch(BASE + `/api/c/${CODE}/send`, { method: 'POST', headers: { 'x-forwarded-for': '10.0.0.61', 'accept-language': 'ar-EG,ar;q=0.9' }, body: fdBig });
+check('oversized photo rejected with an explanation (not silently dropped)', r.status === 400 && (await r.text()).includes('الصورة مرفوضة'));
+check('rejected photo means the message was not sent', sql(`SELECT COUNT(*) AS n FROM messages WHERE body = 'صورة كبيرة'`)[0].n === 0);
+
+r = await req(`/api/cars/${car.id}/bogus`, { method: 'POST', headers: { cookie } });
+check('unknown car op rejected with 404', r.status === 404);
+check('car untouched by bogus op', sql(`SELECT disabled FROM cars WHERE id = '${car.id}'`)[0].disabled === 0);
+
+r = await req(`/api/cars/${car.id}/edit`, { method: 'POST', headers: { ...ip(1), cookie }, body: form({ car_type: 'هاتشباك حمراء', plate: '١٢٣ ن ق د' }) });
+check('car edit accepted', r.status === 302 && sql(`SELECT car_type FROM cars WHERE id = '${car.id}'`)[0].car_type === 'هاتشباك حمراء');
+
+await req('/api/cars', { method: 'POST', headers: { ...ip(1), cookie }, body: form({ car_type: 'عربية للتجربة', plate: '٩٩٩ س س' }) });
+const car2 = sql(`SELECT id, code FROM cars WHERE car_type = 'عربية للتجربة'`)[0];
+r = await req(`/api/c/${car2.code}/send`, { method: 'POST', headers: ip(62), body: form({ body: 'رسالة للعربية المؤقتة' }) });
+check('temp car received a message', r.status === 200);
+r = await req(`/api/cars/${car2.id}/delete`, { method: 'POST', headers: { cookie } });
+check('car delete accepted', r.status === 302);
+check('deleted car is gone', sql(`SELECT COUNT(*) AS n FROM cars WHERE id = '${car2.id}'`)[0].n === 0);
+check('deleted car conversations are gone too', sql(`SELECT COUNT(*) AS n FROM conversations WHERE car_id = '${car2.id}'`)[0].n === 0);
+r = await req(`/c/${car2.code}`);
+check('deleted car sender page 404s', r.status === 404);
+
+r = await req('/api/settings/password', { method: 'POST', headers: { ...ip(1), cookie }, body: form({ current_password: 'wrong-current', new_password: 'newpassword9' }) });
+check('password change rejects wrong current password', r.status === 400);
+r = await req('/api/settings/password', { method: 'POST', headers: { ...ip(1), cookie }, body: form({ current_password: 'supersecret1', new_password: 'newpassword9' }) });
+check('password change accepted and redirects to login', r.status === 302 && r.headers.get('location') === '/login');
+r = await req('/app', { headers: auth });
+check('password change signs out all old sessions', r.status === 302);
+r = await req('/api/login', { method: 'POST', headers: ip(1), body: form({ email: 'owner@test.com', password: 'supersecret1' }) });
+check('old password no longer works', r.status === 401);
+r = await req('/api/login', { method: 'POST', headers: ip(1), body: form({ email: 'owner@test.com', password: 'newpassword9' }) });
+check('new password works', r.status === 302);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

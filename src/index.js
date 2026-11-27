@@ -68,24 +68,80 @@ async function checkCaptcha(db, id, answer) {
   return !!row && row.answer === normDigits(answer).trim();
 }
 
+function stripPng(buf) {
+  // Drop text/EXIF/time chunks; keep everything that renders the image.
+  const drop = new Set(['tEXt', 'iTXt', 'zTXt', 'eXIf', 'tIME']);
+  const parts = [buf.slice(0, 8)];
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let off = 8;
+  while (off + 12 <= buf.length) {
+    const len = dv.getUint32(off);
+    const type = String.fromCharCode(buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]);
+    if (off + 12 + len > buf.length) return buf; // malformed: keep original
+    if (!drop.has(type)) parts.push(buf.slice(off, off + 12 + len));
+    off += 12 + len;
+    if (type === 'IEND') break;
+  }
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let pos = 0;
+  for (const p of parts) { out.set(p, pos); pos += p.length; }
+  return out;
+}
+
+function stripWebp(buf) {
+  // RIFF container: drop EXIF / XMP chunks and clear their VP8X flags.
+  if (buf.length < 12) return buf;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const kept = [];
+  let dropped = false;
+  let off = 12;
+  while (off + 8 <= buf.length) {
+    const fourcc = String.fromCharCode(buf[off], buf[off + 1], buf[off + 2], buf[off + 3]);
+    const size = dv.getUint32(off + 4, true);
+    const total = 8 + size + (size % 2);
+    if (off + total > buf.length) return buf; // malformed: keep original
+    if (fourcc === 'EXIF' || fourcc === 'XMP ') dropped = true;
+    else kept.push([fourcc, buf.slice(off, off + total)]);
+    off += total;
+  }
+  if (!dropped) return buf;
+  let totalLen = 12;
+  for (const [, chunk] of kept) totalLen += chunk.length;
+  const out = new Uint8Array(totalLen);
+  out.set(buf.slice(0, 4), 0); // 'RIFF'
+  new DataView(out.buffer).setUint32(4, totalLen - 8, true);
+  out.set(buf.slice(8, 12), 8); // 'WEBP'
+  let pos = 12;
+  for (const [fourcc, chunk] of kept) {
+    out.set(chunk, pos);
+    if (fourcc === 'VP8X') out[pos + 8] &= ~(0x08 | 0x04); // clear EXIF|XMP flags (first data byte)
+    pos += chunk.length;
+  }
+  return out;
+}
+
 async function storePhoto(env, file) {
-  if (!file || !file.size) return null;
-  if (file.size > 1500 * 1024) return null; // D1 row limit is 2MB
+  if (!file || !file.size) return { key: null };
+  if (file.size > 1500 * 1024) return { error: 'size' }; // D1 row limit is 2MB
   const type = (file.type || '').toLowerCase();
-  if (!['image/jpeg', 'image/png', 'image/webp'].includes(type)) return null;
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(type)) return { error: 'type' };
   let buf = new Uint8Array(await file.arrayBuffer());
-  if (type === 'image/jpeg') {
-    try {
+  try {
+    if (type === 'image/jpeg') {
       let bin = '';
       for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
       const stripped = piexif.remove(bin);
       buf = new Uint8Array(stripped.length);
       for (let i = 0; i < stripped.length; i++) buf[i] = stripped.charCodeAt(i) & 0xff;
-    } catch (_) { /* keep original if stripping fails */ }
-  }
+    } else if (type === 'image/png') {
+      buf = stripPng(buf);
+    } else if (type === 'image/webp') {
+      buf = stripWebp(buf);
+    }
+  } catch (_) { /* keep original if stripping fails */ }
   const key = `${uid(16)}.${type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg'}`;
   await env.DB.prepare('INSERT INTO photos (key, content_type, data) VALUES (?, ?, ?)').bind(key, type, buf).run();
-  return key;
+  return { key };
 }
 
 // ---------- public pages ----------
@@ -220,7 +276,13 @@ app.post('/api/c/:code/send', async (c) => {
   const convId = uid();
   const senderKey = uid(20);
   const email = String(body.sender_email || '').trim() || null;
-  const photoKey = await storePhoto(c.env, body.photo instanceof File ? body.photo : null);
+  const photoFile = body.photo instanceof File ? body.photo : null;
+  let photoKey = null;
+  if (photoFile && photoFile.size) {
+    const stored = await storePhoto(c.env, photoFile);
+    if (stored.error) return err(t.photoRejected); // never drop a photo silently
+    photoKey = stored.key;
+  }
   // Urgency is derived here, never trusted from the client: a sender could
   // otherwise set urgent=1 by hand and bypass quiet hours / unavailable mode.
   const reasonText = String(body.reason || '');
@@ -244,10 +306,19 @@ app.post('/api/c/:code/report', async (c) => {
   const l = lang(c);
   const car = await c.env.DB.prepare('SELECT * FROM cars WHERE code = ?').bind(c.req.param('code')).first();
   if (car) {
-    await c.env.DB.prepare(
-      `UPDATE conversations SET reported = 1, report_reason = COALESCE(report_reason, 'sticker report')
-       WHERE car_id = ? AND last_msg_at >= datetime('now', '-1 day')`,
-    ).bind(car.id).run();
+    // A report flags only the reporter's own conversations with this car.
+    // The QR code is public: letting anyone flag every recent conversation
+    // would let strangers extend retention on (and mark) other people's
+    // conversations. Rate-limited per IP as well; the response page is the
+    // same either way so nothing leaks.
+    const ip = senderIp(c);
+    if (await rateCount(c.env.DB, 'report', ip, 3600) < 5) {
+      await rateHit(c.env.DB, 'report', ip);
+      await c.env.DB.prepare(
+        `UPDATE conversations SET reported = 1, report_reason = COALESCE(report_reason, 'sticker report')
+         WHERE car_id = ? AND sender_ip = ? AND last_msg_at >= datetime('now', '-1 day')`,
+      ).bind(car.id, ip).run();
+    }
   }
   return c.html(simplePage(l, 'SafePark', tr(l).reportDone));
 });
@@ -357,12 +428,37 @@ app.post('/api/cars', async (c) => {
   return redirect('/app');
 });
 
+app.post('/api/cars/:id/edit', async (c) => {
+  const owner = await requireOwner(c);
+  if (!owner) return redirect('/login');
+  const body = await c.req.parseBody();
+  const carType = String(body.car_type || '').trim().slice(0, 80);
+  const plate = String(body.plate || '').trim().slice(0, 30);
+  if (!carType || !plate) return c.html(simplePage('ar', 'بيانات ناقصة', 'نوع العربية واللوحة لازم يكونوا موجودين.'), 400);
+  await c.env.DB.prepare('UPDATE cars SET car_type = ?, plate = ? WHERE id = ? AND owner_id = ?')
+    .bind(carType, plate, c.req.param('id'), owner.id).run();
+  return redirect('/app');
+});
+
 app.post('/api/cars/:id/:op', async (c) => {
   const owner = await requireOwner(c);
   if (!owner) return redirect('/login');
   const op = c.req.param('op');
-  const val = op === 'disable' ? 1 : 0;
-  await c.env.DB.prepare('UPDATE cars SET disabled = ? WHERE id = ? AND owner_id = ?').bind(val, c.req.param('id'), owner.id).run();
+  if (!['disable', 'enable', 'delete'].includes(op)) return c.notFound();
+  const carId = c.req.param('id');
+  if (op === 'delete') {
+    // Remove the car with everything attached: photos, messages, conversations.
+    const car = await c.env.DB.prepare('SELECT id FROM cars WHERE id = ? AND owner_id = ?').bind(carId, owner.id).first();
+    if (!car) return c.notFound();
+    await c.env.DB.prepare(
+      `DELETE FROM photos WHERE key IN (SELECT m.photo_key FROM messages m JOIN conversations co ON co.id = m.conversation_id WHERE co.car_id = ? AND m.photo_key IS NOT NULL)`,
+    ).bind(carId).run();
+    await c.env.DB.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE car_id = ?)').bind(carId).run();
+    await c.env.DB.prepare('DELETE FROM conversations WHERE car_id = ?').bind(carId).run();
+    await c.env.DB.prepare('DELETE FROM cars WHERE id = ? AND owner_id = ?').bind(carId, owner.id).run();
+    return redirect('/app');
+  }
+  await c.env.DB.prepare('UPDATE cars SET disabled = ? WHERE id = ? AND owner_id = ?').bind(op === 'disable' ? 1 : 0, carId, owner.id).run();
   return redirect('/app');
 });
 
@@ -420,6 +516,28 @@ app.post('/api/settings', async (c) => {
   return redirect('/app');
 });
 
+app.post('/api/settings/password', async (c) => {
+  const owner = await requireOwner(c);
+  if (!owner) return redirect('/login');
+  const body = await c.req.parseBody();
+  const { hash } = await hashPassword(String(body.current_password || ''), owner.password_salt);
+  if (!timingSafeEqual(hash, owner.password_hash)) {
+    return c.html(simplePage('ar', 'كلمة السر الحالية غلط', 'كلمة السر الحالية مش صح، فمفيش حاجة اتغيرت.'), 400);
+  }
+  const newPassword = String(body.new_password || '');
+  if (newPassword.length < 8) {
+    return c.html(simplePage('ar', 'كلمة سر ضعيفة', 'كلمة السر الجديدة لازم تكون ٨ حروف على الأقل.'), 400);
+  }
+  const fresh = await hashPassword(newPassword);
+  await c.env.DB.prepare('UPDATE owners SET password_hash = ?, password_salt = ? WHERE id = ?').bind(fresh.hash, fresh.salt, owner.id).run();
+  // A password change signs out every session, including this one.
+  await c.env.DB.prepare('DELETE FROM sessions WHERE owner_id = ?').bind(owner.id).run();
+  return new Response(null, {
+    status: 302,
+    headers: { location: '/login', 'set-cookie': sessionCookie(c, '', 0) },
+  });
+});
+
 app.get('/api/unseen', async (c) => {
   const owner = await requireOwner(c);
   if (!owner) return c.json({ error: 'auth' }, 401);
@@ -435,7 +553,13 @@ app.get('/api/unseen', async (c) => {
 app.get('/api/convcount/:id', async (c) => {
   const owner = await requireOwner(c);
   if (!owner) return c.json({ error: 'auth' }, 401);
-  const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?').bind(c.req.param('id')).first();
+  // Only the owner's own conversations may be counted.
+  const row = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM messages m
+     JOIN conversations co ON co.id = m.conversation_id
+     JOIN cars ca ON ca.id = co.car_id
+     WHERE m.conversation_id = ? AND ca.owner_id = ?`,
+  ).bind(c.req.param('id'), owner.id).first();
   return c.json({ count: row?.n || 0 });
 });
 
@@ -518,8 +642,9 @@ app.get('/sw.js', (c) => {
   event.waitUntil((async function(){
     let title = 'SafePark', body = 'وصلت رسالة جديدة';
     try {
-      const r = await fetch('/api/unseen');
-      if (r.ok) { const d = await r.json(); body = 'عندك ' + d.count + ' رسالة'; }
+      // /api/unseen has no read-tracking, so never claim a count here:
+      // the generic text stays true no matter how many messages exist.
+      await fetch('/api/unseen');
     } catch(_) {}
     await self.registration.showNotification(title, { body: body, dir: 'rtl', lang: 'ar' });
   })());
